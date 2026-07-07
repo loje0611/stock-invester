@@ -204,7 +204,7 @@ class StockScreener:
             if score >= 1:
                 scored_this_round.add(code)
                 recency_bonus = self._recency_weight(self.recent_scores[code])
-                weighted = score + recency_bonus
+                weighted = max(1, score + recency_bonus)
                 candidates.append({
                     "code": code,
                     "curr_prc": curr_prc,
@@ -519,19 +519,23 @@ class TradingEngine(threading.Thread):
 
             # Fallback: 스코어링 통과 종목 없으면 등락률 상위 3개 선정
             if not scored and stocks:
-                positive = [
+                eligible = [
                     s for s in stocks
-                    if s["mk_code"] not in holding_codes and s["flrt"] > 0
+                    if s["mk_code"] not in holding_codes
+                    and 0 < s["curr_prc"] <= 50_000
+                    and s["flrt"] < 29.5
+                    and s["flrt"] > 0
                 ]
-                positive.sort(key=lambda x: x["flrt"], reverse=True)
-                fb = positive[:3] if positive else stocks[:3]
-                fb_codes = [s["mk_code"] for s in fb]
-                self.screener.add_score(fb_codes, points=1)
-                fb_names = [self.stock_names.get(c, c) for c in fb_codes]
-                self._log(
-                    f"[Fallback] 등락률 상위 {len(fb_codes)}개 "
-                    f"자동 선정: {fb_names}"
-                )
+                eligible.sort(key=lambda x: x["flrt"], reverse=True)
+                fb = eligible[:3]
+                if fb:
+                    fb_codes = [s["mk_code"] for s in fb]
+                    self.screener.add_score(fb_codes, points=1)
+                    fb_names = [self.stock_names.get(c, c) for c in fb_codes]
+                    self._log(
+                        f"[Fallback] 등락률 상위 {len(fb_codes)}개 "
+                        f"자동 선정: {fb_names}"
+                    )
 
             elapsed = time.time() - t0
             self._log(
@@ -567,11 +571,16 @@ class TradingEngine(threading.Thread):
             self._log(f"[시스템 오류] 토큰 발급 실패: {e}")
             return
 
-        # 시작 시간까지 대기
+        # 시작 시간까지 대기 — 대기 중에도 1분마다 사전 스크리닝
+        self.cycle_phase = "사전 스크리닝"
+        pre_last_fetch = datetime.min
         while self.running:
             if self._now_hm() >= self.start_hm:
                 break
-            self.cycle_phase = "시작 대기"
+            if (datetime.now() - pre_last_fetch).total_seconds() >= 60:
+                self._log("[사전 스크리닝] 매매 대기 중 — 점수 선축적")
+                self._fetch_and_score()
+                pre_last_fetch = datetime.now()
             time.sleep(1)
 
         self._log(f"[시스템] 매매 시작 (종료 예정: {self.end_hm})")
@@ -587,11 +596,12 @@ class TradingEngine(threading.Thread):
             cycle_end = cycle_start + timedelta(seconds=self.interval_sec)
             self.next_cycle_end = cycle_end
 
-            self.screener.reset()
+            if not is_first_cycle:
+                self.screener.reset()
             self.blacklist.clear()
             self.cycle_phase = "스크리닝"
 
-            # ── 첫 주기: 즉시 스크리닝 → 즉시 매수 ──
+            # ── 첫 주기: 사전 축적 점수 활용 → 즉시 매수 ──
             if is_first_cycle:
                 self._log("[시스템] 첫 주기 — 즉시 스크리닝 후 매수 진행")
                 has_candidates = self._fetch_and_score()
