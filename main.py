@@ -853,7 +853,8 @@ class DashboardWindow:
         if not self.engine.running and self.engine.cycle_phase == "종료":
             self._drain_logs()
             self.lbl_phase.config(text="Status: Finished")
-            self.btn_stop.config(state="disabled", bg="#585b70")
+            self.btn_stop.config(state="disabled", bg="#585b70", text="STOPPED")
+            self.root.after(self.REFRESH_MS, self._update)
             return
 
         with self.state_lock:
@@ -958,23 +959,17 @@ class DashboardWindow:
         self.log_box.config(state="disabled")
 
     def _stop_trading(self):
-        """STOP 버튼 콜백 — 안전한 종료 시퀀스"""
-        self.btn_stop.config(state="disabled", bg="#585b70", text="STOPPING...")
-
-        def _shutdown():
-            self.engine.running = False
-            self.engine._log("[SYSTEM] Trading stopped by user")
-            self.engine.join(timeout=5)
-            self.engine.cycle_phase = "종료"
-            self._drain_logs()
-            self.root.destroy()
-            sys.exit(0)
-
-        threading.Thread(target=_shutdown, daemon=True).start()
+        """STOP 버튼 콜백 — 매매만 중지, 창은 유지"""
+        self.btn_stop.config(state="disabled", bg="#585b70", text="STOPPED")
+        self.engine.running = False
+        self.engine._log("[SYSTEM] Trading stopped by user")
+        self.engine.cycle_phase = "종료"
 
     def _on_close(self):
-        """윈도우 X 버튼 — _stop_trading 과 동일한 안전 종료"""
-        self._stop_trading()
+        """윈도우 X 버튼 — 프로그램 완전 종료"""
+        self.engine.running = False
+        self.engine.cycle_phase = "종료"
+        self.root.destroy()
 
     def run(self):
         self.root.after(500, self._update)
