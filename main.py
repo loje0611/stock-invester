@@ -63,66 +63,79 @@ class KiwoomAPI:
             "api-id": "ka10032",
         }
         payload = {
-            "w_mkt_gb": "101",
+            "mrkt_tp": "101",
+            "mang_stk_incls": "0",
+            "stex_tp": "3",
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
         resp.raise_for_status()
         resp.encoding = "utf-8"
         data = resp.json()
-        raw_list = data.get("output1", data.get("output", []))
+        raw_list = data.get("trde_prica_upper",
+                          data.get("output1", data.get("output", [])))
         if isinstance(raw_list, list):
             return raw_list
         return []
 
     # ---------- 분봉 차트 조회 ----------
     def fetch_minute_chart(self, stock_code: str, ncnt: int = 1) -> List[dict]:
-        """개별 종목 분봉 차트 조회 (TR: ka10081)"""
+        """개별 종목 분봉 차트 조회 (TR: ka10080)"""
         url = f"{self.base_url}/api/dostk/chart"
         headers = {
             **self._headers(),
-            "api-id": "ka10081",
+            "api-id": "ka10080",
         }
         payload = {
-            "stk_code": stock_code,
-            "ncnt": ncnt,
+            "stk_cd": stock_code,
+            "tic_scope": str(ncnt),
+            "upd_stkpc_tp": "1",
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
         resp.raise_for_status()
         resp.encoding = "utf-8"
         data = resp.json()
-        raw = data.get("output1", data.get("output", []))
+        raw = data.get("stk_min_pole_chart_qry",
+                      data.get("output1", data.get("output", [])))
         return raw if isinstance(raw, list) else []
 
     # ---------- 주문 ----------
-    def place_order(self, isin_code: str, quantity: int, side: str) -> dict:
-        """시장가 주문 (side='BUY' 또는 'SELL')"""
-        url = f"{self.base_url}/v1/orders"
-        payload = {
-            "account_no": self.account_no,
-            "order_type": "03",
-            "isin_code": isin_code,
-            "quantity": quantity,
-            "price": 0,
-            "side": side,
+    def place_order(self, stk_cd: str, quantity: int, side: str) -> dict:
+        """시장가 주문 (side='BUY' → kt10000, 'SELL' → kt10001)"""
+        url = f"{self.base_url}/api/dostk/ordr"
+        api_id = "kt10000" if side == "BUY" else "kt10001"
+        headers = {
+            **self._headers(),
+            "api-id": api_id,
         }
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=10)
+        payload = {
+            "dmst_stex_tp": "KRX",
+            "stk_cd": stk_cd,
+            "ord_qty": str(quantity),
+            "trde_tp": "3",
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
         resp.raise_for_status()
         resp.encoding = "utf-8"
-        return resp.json()
+        data = resp.json()
+        if data.get("return_code", 0) != 0:
+            raise RuntimeError(
+                f"주문 실패 [{api_id}]: {data.get('return_msg', 'unknown error')}"
+            )
+        return data
 
 
 # ──────────────────────────────────────────────────────────────
-# 2. 종목 스크리너 / 2단계 필터링 엔진
+# 2. 종목 스크리너 — 모멘텀 기반 실시간 스코어링
 # ──────────────────────────────────────────────────────────────
 class StockScreener:
     """
-    Two-Stage Filtering Engine
-    - Stage 1: 로컬 if문만으로 100 → 10~15개 압축 (API 0회)
-    - Stage 2: 압축된 후보군만 분봉 차트 API 조회 → 점수 누적
+    Momentum Scoring Engine (API 1회로 완결)
+    - 거래대금 상위 100종목 데이터만으로 모멘텀 점수를 산출
+    - S2 분봉 API 제거 → 스크리닝 ~3초 이내 완료
+    - 20분 주기 반복 스크리닝으로 점수 누적 → 안정적 종목 선정
     """
 
-    UPPER_LIMIT_PCT = 30
-    STAGE1_MAX = 15
+    STAGE1_MAX = 20
 
     def __init__(self):
         self.scores: Dict[str, int] = defaultdict(int)
@@ -132,10 +145,17 @@ class StockScreener:
         self.scores.clear()
         self.stock_info.clear()
 
-    # ── Stage 1: 로컬 필터링 (API 호출 0회) ──
-    def stage1_local_filter(self, stocks: List[dict]) -> List[dict]:
-        """가격·등락률 조건으로 100종목 → 10~15개 압축"""
+    def screen_and_score(
+        self,
+        stocks: List[dict],
+        holding_codes: Optional[Set[str]] = None,
+    ) -> List[dict]:
+        """100종목 → 필터 → 모멘텀 스코어링 (API 추가 호출 0회)
+        Returns: 필터 통과 후보 목록 (점수 내림차순)
+        """
+        exclude = holding_codes or set()
         candidates = []
+
         for s in stocks:
             code = str(s.get("mk_code", ""))
             if not code:
@@ -144,101 +164,89 @@ class StockScreener:
             curr_prc = float(s.get("curr_prc", 0))
             flrt = float(s.get("flrt", 0))
             trd_amt = float(s.get("trd_amt", 0))
-            high_prc = float(s.get("high_prc", 0))
+            now_vol = float(s.get("now_vol", 0))
+            pred_vol = float(s.get("pred_vol", 0))
+            rank = int(s.get("rank", 99))
 
             self.stock_info[code] = {
                 "curr_prc": curr_prc,
                 "trd_amt": trd_amt,
                 "flrt": flrt,
-                "high_prc": high_prc,
+                "now_vol": now_vol,
+                "pred_vol": pred_vol,
             }
 
-            if not (2_000 <= curr_prc <= 25_000):
+            if code in exclude:
                 continue
 
-            upper_limit_price = curr_prc / (1 + flrt / 100) * (1 + self.UPPER_LIMIT_PCT / 100) \
-                if flrt != -100 else curr_prc * 1.3
-            if upper_limit_price > 0 and curr_prc > upper_limit_price * 0.95:
+            if curr_prc <= 0 or curr_prc > 50_000:
                 continue
 
-            candidates.append({
-                "code": code,
-                "curr_prc": curr_prc,
-                "trd_amt": trd_amt,
-                "flrt": flrt,
-                "high_prc": high_prc,
-            })
+            if flrt >= 29.5:
+                continue
 
-        candidates.sort(key=lambda x: x["trd_amt"], reverse=True)
+            score = self._momentum_score(
+                flrt=flrt, trd_amt=trd_amt,
+                now_vol=now_vol, pred_vol=pred_vol, rank=rank,
+            )
+
+            if score >= 1:
+                candidates.append({
+                    "code": code,
+                    "curr_prc": curr_prc,
+                    "trd_amt": trd_amt,
+                    "flrt": flrt,
+                    "score": score,
+                })
+                self.scores[code] += score
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[:self.STAGE1_MAX]
 
-    # ── Stage 2: 분봉 차트 기반 정밀 스크리닝 ──
     @staticmethod
-    def _parse_chart_candle(row: dict) -> dict:
-        """분봉 캔들 1건 파싱"""
-        def _n(key: str) -> float:
-            v = row.get(key, 0)
-            if isinstance(v, str):
-                v = v.replace(",", "").strip()
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                return 0.0
+    def _momentum_score(
+        flrt: float, trd_amt: float,
+        now_vol: float, pred_vol: float, rank: int,
+    ) -> int:
+        """단타 모멘텀 점수 (0~10점)"""
+        score = 0
 
-        return {
-            "open": _n("open") or _n("strt_prc") or _n("open_prc"),
-            "high": _n("high") or _n("high_prc"),
-            "low": _n("low") or _n("low_prc"),
-            "close": _n("close") or _n("curr_prc") or _n("cls_prc"),
-            "volume": _n("volume") or _n("trd_qty") or _n("acml_vol"),
-        }
+        # (A) 등락률 양봉 — 상승 중인 종목 우대 (0~3점)
+        if flrt >= 5.0:
+            score += 3
+        elif flrt >= 2.0:
+            score += 2
+        elif flrt > 0:
+            score += 1
 
-    @staticmethod
-    def _check_chart_conditions(candles: List[dict]) -> bool:
-        """이동평균 정배열 + 장대양봉 존재 여부 판정"""
-        if len(candles) < 3:
-            return False
+        # (B) 거래량 폭발 — 전일 대비 거래량 비율 (0~3점)
+        if pred_vol > 0:
+            vol_ratio = now_vol / pred_vol
+            if vol_ratio >= 3.0:
+                score += 3
+            elif vol_ratio >= 1.5:
+                score += 2
+            elif vol_ratio >= 0.8:
+                score += 1
 
-        closes = [c["close"] for c in candles if c["close"] > 0]
-        if len(closes) < 3:
-            return False
+        # (C) 거래대금 순위 — 시장 주목도 (0~2점)
+        if rank <= 10:
+            score += 2
+        elif rank <= 30:
+            score += 1
 
-        ma1 = closes[-1]
-        ma3 = sum(closes[-3:]) / 3
-        if ma1 < ma3:
-            return False
+        # (D) 거래대금 규모 — 유동성 확보 (0~2점)
+        if trd_amt >= 100_000:
+            score += 2
+        elif trd_amt >= 30_000:
+            score += 1
 
-        for candle in candles[-2:]:
-            o, c, vol = candle["open"], candle["close"], candle["volume"]
-            if o <= 0 or c <= 0:
-                continue
-            body_pct = (c - o) / o * 100
-            if body_pct >= 1.5 and vol > 0:
-                return True
+        return score
 
-        return False
-
-    def stage2_chart_filter(
-        self, candidates: List[dict], api: "KiwoomAPI"
-    ) -> List[str]:
-        """후보군에 대해 분봉 API 조회 → 조건 충족 종목 코드 반환"""
-        passed = []
-        for cand in candidates:
-            code = cand["code"]
-            try:
-                raw_candles = api.fetch_minute_chart(code, ncnt=1)
-                candles = [self._parse_chart_candle(r) for r in raw_candles[:10]]
-                if self._check_chart_conditions(candles):
-                    passed.append(code)
-            except Exception:
-                pass
-            time.sleep(0.05)
-        return passed
-
-    def add_score(self, codes: List[str]):
-        """조건 통과 종목에 점수 1점 가산"""
+    def add_score(self, codes: List[str], points: int = 1):
+        """종목에 점수 가산"""
         for code in codes:
-            self.scores[code] += 1
+            self.scores[code] += points
 
     def top_candidate(self, blacklist: Set[str]) -> Optional[Tuple[str, dict]]:
         """블랙리스트 제외 후 누적 점수 최고 종목 반환"""
@@ -342,6 +350,7 @@ class TradingEngine(threading.Thread):
         self.running = True
         self.blacklist: Set[str] = set()
         self.current_prices: Dict[str, float] = {}
+        self.stock_names: Dict[str, str] = {}
         self.next_cycle_end: Optional[datetime] = None
         self.cycle_phase = "대기"
 
@@ -391,37 +400,46 @@ class TradingEngine(threading.Thread):
 
     @staticmethod
     def _parse_stock_row(row: dict) -> Optional[dict]:
-        """API 응답 1건을 내부 표준 포맷으로 변환"""
+        """API 응답 1건을 내부 표준 포맷으로 변환
+        키움 ka10032 실제 필드: stk_cd, cur_prc, trde_prica, flu_rt,
+        now_trde_qty, pred_trde_qty 등
+        """
         code = str(
-            row.get("mk_code", "")
+            row.get("stk_cd", "")
+            or row.get("mk_code", "")
             or row.get("stk_code", "")
             or row.get("shcode", "")
         ).strip()
+        code = code.split("_")[0]
         if not code:
             return None
 
         def _num(key: str) -> float:
             v = row.get(key, 0)
             if isinstance(v, str):
-                v = v.replace(",", "").strip()
+                v = v.replace(",", "").replace("+", "").strip()
             try:
-                return float(v)
+                return abs(float(v))
             except (ValueError, TypeError):
                 return 0.0
 
         return {
             "mk_code": code,
-            "curr_prc": _num("curr_prc") or _num("price") or _num("close"),
-            "trd_amt": _num("trd_amt") or _num("value"),
-            "flrt": _num("flrt") or _num("change_rate") or _num("drate"),
+            "curr_prc": _num("cur_prc") or _num("curr_prc") or _num("price"),
+            "trd_amt": _num("trde_prica") or _num("trd_amt") or _num("value"),
+            "flrt": float(row.get("flu_rt", "0").replace("+", "")) if row.get("flu_rt") else (_num("flrt") or _num("change_rate")),
             "high_prc": _num("high_prc") or _num("high"),
+            "now_vol": _num("now_trde_qty"),
+            "pred_vol": _num("pred_trde_qty"),
+            "rank": _num("now_rank"),
         }
 
-    def _fetch_and_score(self):
-        """1분마다 호출 — 2단계 필터링 파이프라인"""
+    def _fetch_and_score(self) -> bool:
+        """1분마다 호출 — 모멘텀 스코어링 (API 1회, ~3초)
+        Returns: True if at least one candidate scored
+        """
         t0 = time.time()
         try:
-            # API 1회: 거래대금 상위 100종목
             raw_stocks = self.api.fetch_volume_rank()
             stocks = []
             for row in raw_stocks:
@@ -432,23 +450,57 @@ class TradingEngine(threading.Thread):
             with self.state_lock:
                 for s in stocks:
                     self.current_prices[s["mk_code"]] = s["curr_prc"]
+                holding_codes = set(self.portfolio.holdings.keys())
 
-            # Stage 1: 로컬 필터 (API 0회)
-            stage1 = self.screener.stage1_local_filter(stocks)
-            s1_codes = [c["code"] for c in stage1]
+            for row in raw_stocks:
+                cd = str(row.get("stk_cd", "")).split("_")[0]
+                nm = row.get("stk_nm", "")
+                if cd and nm:
+                    self.stock_names[cd] = nm
 
-            # Stage 2: 분봉 차트 정밀 검증 (API N회, N <= 15)
-            passed = self.screener.stage2_chart_filter(stage1, self.api)
-            self.screener.add_score(passed)
+            # 모멘텀 스코어링 (API 추가 호출 없음)
+            scored = self.screener.screen_and_score(stocks, holding_codes)
+
+            # Fallback: 스코어링 통과 종목 없으면 등락률 상위 3개 선정
+            if not scored and stocks:
+                positive = [
+                    s for s in stocks
+                    if s["mk_code"] not in holding_codes and s["flrt"] > 0
+                ]
+                positive.sort(key=lambda x: x["flrt"], reverse=True)
+                fb = positive[:3] if positive else stocks[:3]
+                fb_codes = [s["mk_code"] for s in fb]
+                self.screener.add_score(fb_codes, points=1)
+                fb_names = [self.stock_names.get(c, c) for c in fb_codes]
+                self._log(
+                    f"[Fallback] 등락률 상위 {len(fb_codes)}개 "
+                    f"자동 선정: {fb_names}"
+                )
 
             elapsed = time.time() - t0
             self._log(
-                f"[Screening] {len(stocks)} fetched -> "
-                f"S1: {len(s1_codes)} -> S2: {len(passed)} passed "
-                f"({elapsed:.1f}s)"
+                f"[Screening] {len(stocks)}종목 -> "
+                f"{len(scored)}개 스코어링 완료 ({elapsed:.1f}s)"
             )
+
+            # 현재 최상위 추천 종목 로그 출력
+            top = self.screener.top_candidate(self.blacklist)
+            if top:
+                top_code, top_info = top
+                top_score = self.screener.scores.get(top_code, 0)
+                top_price = self.current_prices.get(
+                    top_code, top_info.get("curr_prc", 0)
+                )
+                top_name = self.stock_names.get(top_code, top_code)
+                self._log(
+                    f"[추천 1위] {top_name}({top_code}) "
+                    f"점수={top_score} / 현재가={top_price:,.0f}원"
+                )
+
+            return bool(self.screener.scores)
         except Exception as e:
             self._log(f"[Fetch Error] {e}")
+            return False
 
     def run(self):
         self._log("[시스템] 매매 엔진 시작 — 토큰 발급 중...")
@@ -468,6 +520,8 @@ class TradingEngine(threading.Thread):
 
         self._log(f"[시스템] 매매 시작 (종료 예정: {self.end_hm})")
 
+        is_first_cycle = True
+
         # ── 메인 매매 루프 ──
         while self.running:
             if self._now_hm() >= self.end_hm:
@@ -481,16 +535,47 @@ class TradingEngine(threading.Thread):
             self.blacklist.clear()
             self.cycle_phase = "스크리닝"
 
-            # 주기 내 1분 단위 스크리닝 (종료 15초 전까지)
-            screening_deadline = cycle_end - timedelta(seconds=15)
-            last_fetch = datetime.min
-            while self.running and datetime.now() < screening_deadline:
-                if self._now_hm() >= self.end_hm:
-                    break
-                if (datetime.now() - last_fetch).total_seconds() >= 60:
-                    self._fetch_and_score()
-                    last_fetch = datetime.now()
-                time.sleep(1)
+            # ── 첫 주기: 즉시 스크리닝 → 즉시 매수 ──
+            if is_first_cycle:
+                self._log("[시스템] 첫 주기 — 즉시 스크리닝 후 매수 진행")
+                has_candidates = self._fetch_and_score()
+                if has_candidates:
+                    candidate = self.screener.top_candidate(self.blacklist)
+                    if candidate:
+                        best_code, info = candidate
+                        price = self.current_prices.get(
+                            best_code, info.get("curr_prc", 0)
+                        )
+                        self._log(
+                            f"[종목 선정] {best_code} "
+                            f"(점수: {self.screener.scores.get(best_code, 0)})"
+                        )
+                        self._buy(best_code, price)
+                    else:
+                        self._log("[스킵] 첫 주기 매수 후보 없음")
+                is_first_cycle = False
+
+                # 첫 매수 후 남은 주기 시간 동안 스크리닝 계속
+                screening_deadline = cycle_end - timedelta(seconds=15)
+                last_fetch = datetime.now()
+                while self.running and datetime.now() < screening_deadline:
+                    if self._now_hm() >= self.end_hm:
+                        break
+                    if (datetime.now() - last_fetch).total_seconds() >= 60:
+                        self._fetch_and_score()
+                        last_fetch = datetime.now()
+                    time.sleep(1)
+            else:
+                # ── 일반 주기: 1분 단위 스크리닝 (종료 15초 전까지) ──
+                screening_deadline = cycle_end - timedelta(seconds=15)
+                last_fetch = datetime.min
+                while self.running and datetime.now() < screening_deadline:
+                    if self._now_hm() >= self.end_hm:
+                        break
+                    if (datetime.now() - last_fetch).total_seconds() >= 60:
+                        self._fetch_and_score()
+                        last_fetch = datetime.now()
+                    time.sleep(1)
 
             if not self.running or self._now_hm() >= self.end_hm:
                 break
@@ -499,7 +584,7 @@ class TradingEngine(threading.Thread):
             self.cycle_phase = "선매도"
             self._sell_all()
 
-            # 종목 확정 (14초 전 ~ 1초 전)
+            # 종목 확정
             self.cycle_phase = "종목 확정"
             candidate = self.screener.top_candidate(self.blacklist)
 
@@ -511,7 +596,10 @@ class TradingEngine(threading.Thread):
             if candidate:
                 best_code, info = candidate
                 price = self.current_prices.get(best_code, info.get("curr_prc", 0))
-                self._log(f"[종목 선정] {best_code} (점수: {self.screener.scores.get(best_code, 0)})")
+                self._log(
+                    f"[종목 선정] {best_code} "
+                    f"(점수: {self.screener.scores.get(best_code, 0)})"
+                )
                 self._buy(best_code, price)
             else:
                 self._log("[스킵] 이번 주기 매수 후보 없음")
@@ -710,14 +798,14 @@ class DashboardWindow:
 
         tk.Label(table_frame, text="Holdings", fg=FG, bg=BG, font=FONT_BOLD, anchor="w").pack(fill="x")
 
-        cols = ("code", "qty", "avg_price", "curr_price", "pnl_pct")
+        cols = ("name", "qty", "avg_price", "curr_price", "pnl_pct")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=6)
         for cid, heading, w in [
-            ("code", "Code", 100),
+            ("name", "Name", 130),
             ("qty", "Qty", 60),
             ("avg_price", "Avg Price", 100),
             ("curr_price", "Cur Price", 100),
-            ("pnl_pct", "P&L(%)", 100),
+            ("pnl_pct", "P&L(%)", 80),
         ]:
             self.tree.heading(cid, text=heading)
             self.tree.column(cid, width=w, anchor="center")
@@ -807,8 +895,9 @@ class DashboardWindow:
         self.tree.delete(*self.tree.get_children())
         for h in holdings:
             pnl_str = f"{h['pnl_pct']:+.2f}"
+            name = self.engine.stock_names.get(h["code"], h["code"])
             self.tree.insert("", "end", values=(
-                h["code"], h["qty"],
+                name, h["qty"],
                 f"{h['avg_price']:,.0f}",
                 f"{h['curr_price']:,.0f}",
                 pnl_str,
