@@ -131,19 +131,22 @@ class StockScreener:
     """
     Momentum Scoring Engine (API 1회로 완결)
     - 거래대금 상위 100종목 데이터만으로 모멘텀 점수를 산출
-    - S2 분봉 API 제거 → 스크리닝 ~3초 이내 완료
+    - 최근 모멘텀 가중치 + 시간대별 거래량 보정 적용
     - 20분 주기 반복 스크리닝으로 점수 누적 → 안정적 종목 선정
     """
 
     STAGE1_MAX = 20
+    STALE_STREAK = 3
 
     def __init__(self):
         self.scores: Dict[str, int] = defaultdict(int)
         self.stock_info: Dict[str, dict] = {}
+        self.recent_scores: Dict[str, List[int]] = defaultdict(list)
 
     def reset(self):
         self.scores.clear()
         self.stock_info.clear()
+        self.recent_scores.clear()
 
     def screen_and_score(
         self,
@@ -155,6 +158,9 @@ class StockScreener:
         """
         exclude = holding_codes or set()
         candidates = []
+        hour = datetime.now().hour
+
+        scored_this_round: Set[str] = set()
 
         for s in stocks:
             code = str(s.get("mk_code", ""))
@@ -187,18 +193,32 @@ class StockScreener:
 
             score = self._momentum_score(
                 flrt=flrt, trd_amt=trd_amt,
-                now_vol=now_vol, pred_vol=pred_vol, rank=rank,
+                now_vol=now_vol, pred_vol=pred_vol,
+                rank=rank, hour=hour,
             )
 
+            self.recent_scores[code].append(score)
+            if len(self.recent_scores[code]) > 5:
+                self.recent_scores[code] = self.recent_scores[code][-5:]
+
             if score >= 1:
+                scored_this_round.add(code)
+                recency_bonus = self._recency_weight(self.recent_scores[code])
+                weighted = score + recency_bonus
                 candidates.append({
                     "code": code,
                     "curr_prc": curr_prc,
                     "trd_amt": trd_amt,
                     "flrt": flrt,
-                    "score": score,
+                    "score": weighted,
                 })
-                self.scores[code] += score
+                self.scores[code] += weighted
+
+        for code in list(self.recent_scores.keys()):
+            if code not in scored_this_round:
+                self.recent_scores[code].append(0)
+                if len(self.recent_scores[code]) > 5:
+                    self.recent_scores[code] = self.recent_scores[code][-5:]
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[:self.STAGE1_MAX]
@@ -206,9 +226,10 @@ class StockScreener:
     @staticmethod
     def _momentum_score(
         flrt: float, trd_amt: float,
-        now_vol: float, pred_vol: float, rank: int,
+        now_vol: float, pred_vol: float,
+        rank: int, hour: int,
     ) -> int:
-        """단타 모멘텀 점수 (0~10점)"""
+        """단타 모멘텀 점수 (0~10점), 시간대별 거래량 보정 포함"""
         score = 0
 
         # (A) 등락률 양봉 — 상승 중인 종목 우대 (0~3점)
@@ -219,14 +240,21 @@ class StockScreener:
         elif flrt > 0:
             score += 1
 
-        # (B) 거래량 폭발 — 전일 대비 거래량 비율 (0~3점)
+        # (B) 거래량 폭발 — 시간대별 보정 적용 (0~3점)
         if pred_vol > 0:
             vol_ratio = now_vol / pred_vol
-            if vol_ratio >= 3.0:
+            if hour >= 14:
+                thresholds = (5.0, 3.0, 1.5)
+            elif hour >= 12:
+                thresholds = (4.0, 2.0, 1.0)
+            else:
+                thresholds = (3.0, 1.5, 0.8)
+
+            if vol_ratio >= thresholds[0]:
                 score += 3
-            elif vol_ratio >= 1.5:
+            elif vol_ratio >= thresholds[1]:
                 score += 2
-            elif vol_ratio >= 0.8:
+            elif vol_ratio >= thresholds[2]:
                 score += 1
 
         # (C) 거래대금 순위 — 시장 주목도 (0~2점)
@@ -243,18 +271,46 @@ class StockScreener:
 
         return score
 
+    @staticmethod
+    def _recency_weight(history: List[int]) -> int:
+        """최근 스코어 추세에 따른 보너스/페널티 (-2 ~ +2)"""
+        if len(history) < 2:
+            return 0
+        recent = history[-2:]
+        avg_recent = sum(recent) / len(recent)
+        if len(history) >= 3:
+            avg_older = sum(history[:-2]) / max(len(history) - 2, 1)
+        else:
+            avg_older = history[0]
+
+        if avg_recent >= avg_older + 2:
+            return 2
+        elif avg_recent > avg_older:
+            return 1
+        elif avg_recent <= avg_older - 3:
+            return -2
+        elif avg_recent < avg_older - 1:
+            return -1
+        return 0
+
     def add_score(self, codes: List[str], points: int = 1):
         """종목에 점수 가산"""
         for code in codes:
             self.scores[code] += points
 
     def top_candidate(self, blacklist: Set[str]) -> Optional[Tuple[str, dict]]:
-        """블랙리스트 제외 후 누적 점수 최고 종목 반환"""
-        candidates = {
-            code: score
-            for code, score in self.scores.items()
-            if code not in blacklist and score > 0
-        }
+        """블랙리스트 제외 + 모멘텀 꺾임 종목 제외 후 최고 점수 종목 반환"""
+        candidates = {}
+        for code, score in self.scores.items():
+            if code in blacklist or score <= 0:
+                continue
+            history = self.recent_scores.get(code, [])
+            if len(history) >= self.STALE_STREAK:
+                tail = history[-self.STALE_STREAK:]
+                if all(s == 0 for s in tail):
+                    continue
+            candidates[code] = score
+
         if not candidates:
             return None
         best_code = max(candidates, key=candidates.get)
