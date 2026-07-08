@@ -129,11 +129,17 @@ class KiwoomAPI:
 # ──────────────────────────────────────────────────────────────
 class StockScreener:
     """
-    Momentum Scoring Engine (API 1회로 완결)
-    - 거래대금 상위 100종목 데이터만으로 모멘텀 점수를 산출
-    - 최근 모멘텀 가중치 + 시간대별 거래량 보정 적용
-    - 20분 주기 반복 스크리닝으로 점수 누적 → 안정적 종목 선정
+    Multi-Algorithm Scoring Engine (API 1회로 완결)
+    algo=1: 균형 모멘텀 — 등락률·거래량·순위·대금 균형 배점
+    algo=2: 급등 추격 — 등락률 가중, 강한 상승세 종목 집중
+    algo=3: 거래량 폭발 — 거래량 급증 + 저가주 집중, 폭발 초입 포착
     """
+
+    ALGO_NAMES = {
+        1: "균형 모멘텀",
+        2: "급등 추격",
+        3: "거래량 폭발",
+    }
 
     STAGE1_MAX = 20
     STALE_STREAK = 3
@@ -142,6 +148,7 @@ class StockScreener:
         self.scores: Dict[str, int] = defaultdict(int)
         self.stock_info: Dict[str, dict] = {}
         self.recent_scores: Dict[str, List[int]] = defaultdict(list)
+        self.algorithm: int = 1
 
     def reset(self):
         self.scores.clear()
@@ -185,17 +192,41 @@ class StockScreener:
             if code in exclude:
                 continue
 
-            if curr_prc <= 0 or curr_prc > 50_000:
+            if curr_prc <= 0:
                 continue
 
-            if flrt >= 29.5:
-                continue
+            if self.algorithm == 2:
+                if curr_prc > 50_000:
+                    continue
+                if flrt >= 29.8:
+                    continue
+            elif self.algorithm == 3:
+                if curr_prc > 30_000:
+                    continue
+                if flrt >= 29.5:
+                    continue
+            else:
+                if curr_prc > 50_000:
+                    continue
+                if flrt >= 29.5:
+                    continue
 
-            score = self._momentum_score(
-                flrt=flrt, trd_amt=trd_amt,
-                now_vol=now_vol, pred_vol=pred_vol,
-                rank=rank, hour=hour,
-            )
+            if self.algorithm == 2:
+                score = self._surge_chaser_score(
+                    flrt=flrt, trd_amt=trd_amt,
+                    now_vol=now_vol, pred_vol=pred_vol, rank=rank,
+                )
+            elif self.algorithm == 3:
+                score = self._volume_explosion_score(
+                    flrt=flrt, curr_prc=curr_prc, trd_amt=trd_amt,
+                    now_vol=now_vol, pred_vol=pred_vol, hour=hour,
+                )
+            else:
+                score = self._momentum_score(
+                    flrt=flrt, trd_amt=trd_amt,
+                    now_vol=now_vol, pred_vol=pred_vol,
+                    rank=rank, hour=hour,
+                )
 
             self.recent_scores[code].append(score)
             if len(self.recent_scores[code]) > 5:
@@ -267,6 +298,95 @@ class StockScreener:
         if trd_amt >= 100_000:
             score += 2
         elif trd_amt >= 30_000:
+            score += 1
+
+        return score
+
+    @staticmethod
+    def _surge_chaser_score(
+        flrt: float, trd_amt: float,
+        now_vol: float, pred_vol: float, rank: int,
+    ) -> int:
+        """알고리즘 2: 급등 추격 (0~12점)
+        등락률에 극단적 가중치 → 지금 가장 세게 오르는 종목에 올인
+        """
+        score = 0
+
+        if flrt >= 15.0:
+            score += 5
+        elif flrt >= 10.0:
+            score += 4
+        elif flrt >= 5.0:
+            score += 3
+        elif flrt >= 2.0:
+            score += 2
+        elif flrt > 0:
+            score += 1
+
+        if pred_vol > 0:
+            vol_ratio = now_vol / pred_vol
+            if vol_ratio >= 2.0:
+                score += 3
+            elif vol_ratio >= 1.0:
+                score += 2
+            elif vol_ratio >= 0.5:
+                score += 1
+
+        if rank <= 5:
+            score += 2
+        elif rank <= 15:
+            score += 1
+
+        if trd_amt >= 50_000:
+            score += 2
+
+        return score
+
+    @staticmethod
+    def _volume_explosion_score(
+        flrt: float, curr_prc: float, trd_amt: float,
+        now_vol: float, pred_vol: float, hour: int,
+    ) -> int:
+        """알고리즘 3: 거래량 폭발 (0~14점)
+        거래량이 비정상적으로 터지는 저가주를 포착 → 폭등 초입 진입
+        """
+        score = 0
+
+        if pred_vol > 0:
+            vol_ratio = now_vol / pred_vol
+            if hour >= 14:
+                thresholds = (8.0, 5.0, 3.0, 1.5)
+            elif hour >= 12:
+                thresholds = (6.0, 4.0, 2.5, 1.2)
+            else:
+                thresholds = (5.0, 3.0, 2.0, 1.0)
+
+            if vol_ratio >= thresholds[0]:
+                score += 5
+            elif vol_ratio >= thresholds[1]:
+                score += 4
+            elif vol_ratio >= thresholds[2]:
+                score += 3
+            elif vol_ratio >= thresholds[3]:
+                score += 2
+
+        if curr_prc <= 3_000:
+            score += 3
+        elif curr_prc <= 7_000:
+            score += 2
+        elif curr_prc <= 15_000:
+            score += 1
+
+        if flrt >= 3.0:
+            score += 3
+        elif flrt >= 1.0:
+            score += 2
+        elif flrt > 0:
+            score += 1
+
+        if trd_amt >= 30_000:
+            score += 2
+        elif trd_amt >= 10_000:
             score += 1
 
         return score
@@ -855,6 +975,31 @@ class DashboardWindow:
         )
         self.lbl_countdown.pack(side="left", padx=(0, 24))
 
+        # ── 알고리즘 선택 ──
+        algo_row = tk.Frame(top, bg=BG)
+        algo_row.pack(fill="x", pady=(8, 0))
+
+        tk.Label(algo_row, text="Algorithm:", fg=FG, bg=BG, font=FONT_BOLD).pack(side="left")
+
+        self._algo_var = tk.IntVar(value=1)
+        for algo_id, label in [
+            (1, "1. 균형 모멘텀"),
+            (2, "2. 급등 추격"),
+            (3, "3. 거래량 폭발"),
+        ]:
+            rb = tk.Radiobutton(
+                algo_row, text=label, variable=self._algo_var, value=algo_id,
+                command=self._on_algo_change,
+                bg=BG, fg=FG, selectcolor="#313244", activebackground=BG,
+                activeforeground=ACCENT, font=FONT, indicatoron=True, cursor="hand2",
+            )
+            rb.pack(side="left", padx=(12, 0))
+
+        self.lbl_algo_status = tk.Label(
+            algo_row, text="", fg="#f9e2af", bg=BG, font=FONT,
+        )
+        self.lbl_algo_status.pack(side="right")
+
         # 구분선
         tk.Frame(self.root, bg=DIM, height=1).pack(fill="x", padx=16)
 
@@ -936,7 +1081,9 @@ class DashboardWindow:
             "종료": "Finished",
         }
         phase_en = phase_map.get(self.engine.cycle_phase, self.engine.cycle_phase)
-        self.lbl_phase.config(text=f"Status: {phase_en}")
+        algo_id = self.engine.screener.algorithm
+        algo_tag = StockScreener.ALGO_NAMES.get(algo_id, str(algo_id))
+        self.lbl_phase.config(text=f"Status: {phase_en}  |  Algo: {algo_tag}")
         self.lbl_total.config(text=f"Total: {total_eval:,.0f} KRW")
         ret_color = "#a6e3a1" if total_ret >= 0 else "#f38ba8"
         self.lbl_return.config(text=f"P&L: {total_ret:+.2f}%", fg=ret_color)
@@ -1023,6 +1170,16 @@ class DashboardWindow:
         if has_new:
             self.log_box.see("end")
         self.log_box.config(state="disabled")
+
+    def _on_algo_change(self):
+        """알고리즘 변경 라디오 버튼 콜백"""
+        new_algo = self._algo_var.get()
+        self.engine.screener.algorithm = new_algo
+        self.engine.screener.reset()
+        algo_name = StockScreener.ALGO_NAMES.get(new_algo, str(new_algo))
+        self.lbl_algo_status.config(text=f"→ {algo_name} 적용됨")
+        self.engine._log(f"[SYSTEM] Algorithm changed: {algo_name}")
+        self.root.after(3000, lambda: self.lbl_algo_status.config(text=""))
 
     def _stop_trading(self):
         """STOP 버튼 콜백 — 매매만 중지, 창은 유지"""
